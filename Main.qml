@@ -17,14 +17,26 @@ Item {
   property bool isStale: false
   property string staleReason: ""
   property bool collectorRunning: false
+  property var activeCollectorProcess: null
+  property double collectorStartedAt: 0
   property string representationMode: "remaining"
+  property int settingsVersion: 0
 
   readonly property string collectorPath: pluginApi.pluginDir + "/scripts/ai-usage-collector"
   readonly property int refreshIntervalMs: Math.max(10000, pluginApi.pluginSettings.refreshIntervalMs || 60000)
+  readonly property int collectorTimeoutMs: Math.max(10000, pluginApi.pluginSettings.collectorTimeoutMs || 30000)
   readonly property int staleAfterMs: pluginApi.pluginSettings.staleAfterMs || 600000
   readonly property string timezone: pluginApi.pluginSettings.timezone || "UTC"
 
   Component.onCompleted: refreshNow()
+
+  Connections {
+    target: root.pluginApi
+
+    function onPluginSettingsChanged() {
+      root.applySettings(false);
+    }
+  }
 
   Timer {
     interval: root.refreshIntervalMs
@@ -34,21 +46,120 @@ Item {
     onTriggered: root.refreshNow()
   }
 
+  Timer {
+    id: collectorTimeoutTimer
+
+    interval: root.collectorTimeoutMs
+    repeat: false
+    onTriggered: root.cancelActiveCollector("collector timed out")
+  }
+
+  function providerSettings() {
+    if (!pluginApi || !pluginApi.pluginSettings || !pluginApi.pluginSettings.providers)
+      return {};
+    return pluginApi.pluginSettings.providers;
+  }
+
+  function isProviderEnabled(id) {
+    var settings = providerSettings();
+    return settings[id] !== false;
+  }
+
+  function enabledProviderIds() {
+    var ids = [];
+    if (isProviderEnabled("codex"))
+      ids.push("codex");
+    if (isProviderEnabled("opencode-go"))
+      ids.push("opencode-go");
+    if (isProviderEnabled("claude"))
+      ids.push("claude");
+    return ids;
+  }
+
+  function filterEnabledProviders(items) {
+    var rows = [];
+    for (var i = 0; i < items.length; i++) {
+      if (items[i] && isProviderEnabled(items[i].id))
+        rows.push(items[i]);
+    }
+    return rows;
+  }
+
+  function applySettings(refresh) {
+    providers = filterEnabledProviders(providers || []);
+    settingsVersion++;
+    rebuildSummary();
+    rebuildTooltipRows();
+    if (refresh === true)
+      refreshNow();
+  }
+
+  function reloadSettings() {
+    applySettings(true);
+  }
+
   function refreshNow() {
-    if (collectorRunning)
+    if (collectorRunning) {
+      if (collectorStartedAt > 0 && Date.now() - collectorStartedAt > collectorTimeoutMs)
+        cancelActiveCollector("previous collector timed out");
+      else
+        return false;
+    }
+
+    var ids = enabledProviderIds();
+    if (ids.length === 0) {
+      providers = [];
+      lastUpdated = new Date().toISOString();
+      isStale = false;
+      staleReason = "";
+      rebuildSummary();
+      rebuildTooltipRows();
       return false;
+    }
 
     collectorRunning = true;
+    collectorStartedAt = Date.now();
     var proc = Qt.createQmlObject('import QtQuick; import Quickshell.Io; Process { stdout: StdioCollector {} }', root, "AiUsageCollector");
-    proc.command = ["env", "AI_USAGE_TIMEZONE=" + timezone, collectorPath];
+    activeCollectorProcess = proc;
+    proc.command = ["env", "AI_USAGE_TIMEZONE=" + timezone, "AI_USAGE_ENABLED_PROVIDERS=" + ids.join(","), collectorPath];
     proc.exited.connect(function (exitCode) {
+      if (proc !== root.activeCollectorProcess) {
+        proc.destroy();
+        return;
+      }
+
       var text = String(proc.stdout.text || "");
       root.collectorRunning = false;
+      root.collectorStartedAt = 0;
+      root.activeCollectorProcess = null;
+      collectorTimeoutTimer.stop();
       root.consumeCollectorOutput(text, exitCode);
       proc.destroy();
     });
+    collectorTimeoutTimer.restart();
     proc.running = true;
     return true;
+  }
+
+  function cancelActiveCollector(reason) {
+    var proc = activeCollectorProcess;
+    activeCollectorProcess = null;
+    collectorRunning = false;
+    collectorStartedAt = 0;
+    collectorTimeoutTimer.stop();
+
+    if (proc) {
+      try {
+        if (proc.running)
+          proc.signal(15);
+      } catch (e) {}
+      proc.destroy();
+    }
+
+    isStale = true;
+    staleReason = reason || "collector stopped";
+    rebuildSummary();
+    rebuildTooltipRows();
   }
 
   function consumeCollectorOutput(text, exitCode) {
@@ -62,7 +173,7 @@ Item {
 
     try {
       var data = JSON.parse(text);
-      providers = data.providers || [];
+      providers = filterEnabledProviders(data.providers || []);
       lastUpdated = data.updatedAt || "";
       var ageStale = isDataOlderThanStaleThreshold(data.updatedAt || "");
       isStale = data.stale === true || ageStale;
@@ -91,7 +202,7 @@ Item {
     var next = Object.assign({}, historyByProvider);
     for (var i = 0; i < items.length; i++) {
       var provider = items[i];
-      if (!provider || provider.available === false)
+      if (!provider || provider.available === false || !isProviderEnabled(provider.id))
         continue;
 
       var value = null;
@@ -119,6 +230,8 @@ Item {
   }
 
   function providerById(id) {
+    if (!isProviderEnabled(id))
+      return null;
     for (var i = 0; i < providers.length; i++) {
       if (providers[i].id === id)
         return providers[i];
@@ -314,20 +427,110 @@ Item {
     return rows.length > 0 ? rows[0] : null;
   }
 
-  function compactFor(provider, shortLabel) {
+  function isCompactMode() {
+    return pluginApi.pluginSettings.compactMode === true;
+  }
+
+  function setCompactMode(enabled) {
+    pluginApi.pluginSettings = Object.assign({}, pluginApi.pluginSettings || {}, {
+      "compactMode": enabled === true
+    });
+    pluginApi.saveSettings();
+    applySettings(false);
+  }
+
+  function toggleCompactMode() {
+    setCompactMode(!isCompactMode());
+  }
+
+  function formatResetRemaining(value) {
+    if (!value)
+      return "";
+    var reset = new Date(value);
+    if (isNaN(reset.getTime()))
+      return "";
+    var minutes = Math.max(0, Math.ceil((reset.getTime() - Date.now()) / 60000));
+    if (minutes < 60)
+      return minutes + "m";
+
+    var hours = Math.floor(minutes / 60);
+    var remainderMinutes = minutes % 60;
+    if (hours < 24) {
+      if (hours < 10 && remainderMinutes > 0)
+        return hours + "h" + remainderMinutes + "m";
+      return hours + "h";
+    }
+
+    var days = Math.floor(hours / 24);
+    var remainderHours = hours % 24;
+    if (days < 10 && remainderHours > 0)
+      return days + "d" + remainderHours + "h";
+    return days + "d";
+  }
+
+  function barWindowText(windowData, includeLabel) {
+    var text = "";
+    if (includeLabel)
+      text += (windowData.label || windowData.id) + ":";
+    text += displayPercentText(windowData);
+    var reset = formatResetRemaining(windowData.resetAt);
+    if (reset !== "")
+      text += ":" + reset;
+    return text;
+  }
+
+  function compactStateText(provider) {
+    var state = providerStateText(provider);
+    if (state === "Auth required")
+      return "auth";
+    if (state === "Timed out")
+      return "timeout";
+    if (state === "Rate limited")
+      return "rate";
+    if (state.indexOf("cooldown") !== -1 || state.indexOf("Cooldown") !== -1)
+      return "cooldown";
+    if (state === "Stale cache")
+      return "stale";
+    return state || "n/a";
+  }
+
+  function compactBarFor(provider, shortLabel) {
+    if (!provider || provider.available === false)
+      return shortLabel + " " + compactStateText(provider);
+
+    var label = shortLabel + (provider.stale ? "*" : "");
+    if (provider.mode === "exact-remaining") {
+      var rows = quotaWindows(provider);
+      if (rows.length === 0)
+        return label + " n/a";
+      var values = [];
+      for (var i = 0; i < rows.length; i++)
+        values.push(barWindowText(rows[i], false));
+      var text = label + " " + values.join(" ");
+      var state = compactStateText(provider);
+      if (state !== "n/a" && state !== "Statusline cache" && state !== "Cached")
+        text += " " + state;
+      return text;
+    }
+
+    return label + " n/a";
+  }
+
+  function detailedBarFor(provider, shortLabel) {
     if (!provider || provider.available === false) {
       var unavailableState = providerStateText(provider);
       return shortLabel + " " + (unavailableState || "n/a");
     }
 
-    var label = shortLabel + ((provider.stale || isStale) ? "*" : "");
+    var label = shortLabel + (provider.stale ? "*" : "");
     if (provider.mode === "exact-remaining") {
       var rows = quotaWindows(provider);
       if (rows.length === 0)
         return label + " n/a";
-      var text = label;
+      var values = [];
       for (var i = 0; i < rows.length; i++)
-        text += " " + (rows[i].label || rows[i].id) + " " + displayPercentText(rows[i]);
+        values.push(barWindowText(rows[i], true));
+      var text = label + " " + values.join(" | ");
       var state = providerStateText(provider);
       if (state && state !== "Statusline cache")
         text += " " + state;
@@ -337,14 +540,21 @@ Item {
     return label + " n/a";
   }
 
+  function barTextFor(provider, detailedLabel, compactLabel) {
+    return isCompactMode() ? compactBarFor(provider, compactLabel) : detailedBarFor(provider, detailedLabel);
+  }
+
   function rebuildSummary() {
     var parts = [];
     if (pluginApi.pluginSettings.showUsedOnlyProvidersInBar !== false) {
-      parts.push(compactFor(providerById("codex"), "Codex"));
-      parts.push(compactFor(providerById("opencode-go"), "Go"));
+      if (isProviderEnabled("codex"))
+        parts.push(barTextFor(providerById("codex"), "Codex", "Cx"));
+      if (isProviderEnabled("opencode-go"))
+        parts.push(barTextFor(providerById("opencode-go"), "Go", "Go"));
     }
-    parts.push(compactFor(providerById("claude"), "Claude"));
-    summaryText = parts.join("  ");
+    if (isProviderEnabled("claude"))
+      parts.push(barTextFor(providerById("claude"), "Claude", "Cl"));
+    summaryText = parts.length > 0 ? parts.join(" · ") : "AI Usage off";
   }
 
   function providerTooltipValue(provider) {
@@ -384,7 +594,7 @@ Item {
       rows.push([providers[i].label || providers[i].id, providerTooltipValue(providers[i])]);
 
     if (rows.length === 0)
-      rows.push(["AI Usage", "No data yet"]);
+      rows.push(["AI Usage", enabledProviderIds().length === 0 ? "All providers disabled" : "No data yet"]);
 
     rows.push(["Updated", formatDateTime(lastUpdated)]);
     if (isStale)
